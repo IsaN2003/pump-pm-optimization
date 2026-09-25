@@ -1,0 +1,19 @@
+# --- Confidential data: never commit ---
+data/raw/*
+!data/raw/README.md
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Testing ---
+.pytest_cache/
+
+# --- OS / editor clutter ---
+.DS_Store
+Thumbs.db
+.vscode/
