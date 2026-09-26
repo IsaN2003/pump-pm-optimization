@@ -59,7 +59,9 @@ Including the suspensions matters: fitting the 47 failures alone would give η �
 ### 3. Optimization model
 The decision variable is the PM interval $x$ (1 to 12 months). Both objectives are minimized:
 
-$$C(x) = \frac{12}{x}\, C_{PM}\, n + F(x)\, C_{CM}\, n \qquad\qquad F(x) = 1 - e^{-(x/\eta)^{\beta}}$$
+```math
+C(x) = \frac{12}{x}\, C_{PM}\, n + F(x)\, C_{CM}\, n \qquad\qquad F(x) = 1 - e^{-(x/\eta)^{\beta}}
+```
 
 where $n$ = 99 pumps, $C_{PM}$ = 1 (one PM job) and $C_{CM}$ ≈ 125.66 (average corrective job, relative to a PM job). Annual cost is reported as an index, with the current 6-month plan = 100.
 
