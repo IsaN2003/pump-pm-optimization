@@ -1,10 +1,13 @@
 """Shared code for the pump preventive-maintenance optimization project.
 
-The notebooks import this module so that paths, work-order rules and the
-data-preparation logic live in one place and can be unit tested.
+The notebooks import this module so that paths, model constants, the
+data-preparation logic and the Weibull fitting live in one place and can be
+unit tested.
 """
+import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 # Paths
@@ -17,6 +20,10 @@ FIG_DIR = ROOT / "figures"
 
 RAW_WORK_ORDERS = RAW_DIR / "work_orders.csv"
 FAILURE_TIMES = DATA_DIR / "failure_times.csv"
+WEIBULL_PARAMS = DATA_DIR / "weibull_params.json"
+
+# Model constants
+HOURS_PER_MONTH = 30.42 * 24  # average month length (30.42 days) in hours
 
 # Work-order classification
 # Other order types in the export (GSRT, EPRT, RWRT, ...) say nothing about
@@ -92,3 +99,76 @@ def anonymize_units(failure_times):
     width = max(2, len(str(len(out))))
     out["unit_id"] = [f"P{i:0{width}d}" for i in range(1, len(out) + 1)]
     return out
+
+
+# Weibull analysis
+def median_rank_table(hours, failed):
+    """Build the median-rank table: rank, reversed rank, Johnson's
+    adjusted rank, Bernard's median rank, ln(t) and ln(ln(1/(1-F))). Returns failures only.
+    """
+    table = pd.DataFrame({"hours": np.asarray(hours, float), "failed": np.asarray(failed, int)})
+    # Rank all pumps by time. On ties, failures come before suspensions, the
+    # same convention as build_failure_times.
+    table = table.sort_values(["hours", "failed"], ascending=[True, False]).reset_index(drop=True)
+    n = len(table)
+    table["rank"] = np.arange(1, n + 1)
+    table["reversed_rank"] = n - table["rank"] + 1
+
+    # Johnson's adjusted rank: each suspension spreads its share of the
+    # remaining ranks over the later failures, so a failure's rank is bumped up
+    # by the suspensions before it. Suspensions get no rank of their own.
+    adj_ranks, prev = [], 0.0
+    for rr, f in zip(table["reversed_rank"], table["failed"]):
+        if f:
+            prev = prev + (n + 1 - prev) / (1 + rr)
+            adj_ranks.append(prev)
+        else:
+            adj_ranks.append(np.nan)
+    table["adj_rank"] = adj_ranks
+
+    # Only failures are plotted: estimate F with Bernard's approximation, then
+    # take the Weibull plot coordinates x = ln(t), y = ln(ln(1/(1-F))).
+    fails = table[table["failed"] == 1].copy()
+    fails["median_rank"] = (fails["adj_rank"] - 0.3) / (n + 0.4)
+    fails["ln_t"] = np.log(fails["hours"])
+    fails["ln_ln"] = np.log(-np.log(1 - fails["median_rank"]))
+    return fails.reset_index(drop=True)
+
+
+def fit_weibull_mrr(hours, failed):
+    """Fit a 2-parameter Weibull by median-rank regression (regression of y on x)."""
+    table = median_rank_table(hours, failed)
+    # On the Weibull plot the line is y = beta * x - beta * ln(eta), so the
+    # slope is beta and eta comes back from the intercept.
+    beta, intercept = np.polyfit(table["ln_t"], table["ln_ln"], 1)
+    r2 = np.corrcoef(table["ln_t"], table["ln_ln"])[0, 1] ** 2
+    return {
+        "beta": float(beta),
+        "eta_hours": float(np.exp(-intercept / beta)),
+        "intercept": float(intercept),
+        "r2": float(r2),
+        "n_units": int(len(hours)),
+        "n_failures": int(np.sum(failed)),
+    }
+
+
+def reliability(t, beta, eta):
+    """R(t) = exp(-(t/eta)^beta). t and eta must be in the same unit."""
+    return np.exp(-((np.asarray(t, float) / eta) ** beta))
+
+
+def failure_prob(t, beta, eta):
+    """F(t) = 1 - R(t): probability of failing by time t."""
+    return 1 - reliability(t, beta, eta)
+
+
+def save_params(params, path=WEIBULL_PARAMS):
+    """Save the fitted Weibull parameters (adds eta in months) for later notebooks."""
+    params = dict(params)
+    params["eta_months"] = params["eta_hours"] / HOURS_PER_MONTH
+    path.write_text(json.dumps(params, indent=2))
+
+
+def load_params(path=WEIBULL_PARAMS):
+    """Load the Weibull parameters saved by notebook 02."""
+    return json.loads(path.read_text())
