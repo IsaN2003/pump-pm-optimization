@@ -1,10 +1,11 @@
 """Shared code for the pump preventive-maintenance optimization project.
 
 The notebooks import this module so that paths, model constants, the
-data-preparation logic and the Weibull fitting live in one place and can be
-unit tested.
+data-preparation logic, the Weibull fitting and the PM-interval optimization
+model live in one place and can be unit tested.
 """
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +25,12 @@ WEIBULL_PARAMS = DATA_DIR / "weibull_params.json"
 
 # Model constants
 HOURS_PER_MONTH = 30.42 * 24  # average month length (30.42 days) in hours
+# Costs are in relative units: one PM job = 1, and a corrective job costs
+# about 126 times as much. Reported annual costs are an index (current plan = 100).
+PM_COST = 1.0                 # cost of one PM job
+CM_COST = 125.6611491829204   # cost of one corrective job, relative to a PM job
+CURRENT_PM_INTERVAL = 6.0     # months, the current plan
+BOUNDS = (1.0, 12.0)          # allowed PM intervals (months)
 
 # Work-order classification
 # Other order types in the export (GSRT, EPRT, RWRT, ...) say nothing about
@@ -172,3 +179,110 @@ def save_params(params, path=WEIBULL_PARAMS):
 def load_params(path=WEIBULL_PARAMS):
     """Load the Weibull parameters saved by notebook 02."""
     return json.loads(path.read_text())
+
+
+# Optimization model
+@dataclass(frozen=True)
+class PMModel:
+    """The PM-interval model. Times are in months, costs in relative units.
+
+    Objective 1:          C(x) = (12/x) * C_PM * n  +  F(x) * C_CM * n
+                          (reported as an index, current plan = 100)
+    Objective 2:          F(x) = 1 - exp(-(x/eta)^beta)
+    """
+
+    beta: float
+    eta_months: float
+    n_pumps: int
+    pm_cost: float = PM_COST
+    cm_cost: float = CM_COST
+
+    def failure_prob(self, x):
+        """Probability that a pump fails within a PM interval of x months."""
+        return failure_prob(x, self.beta, self.eta_months)
+
+    def reliability(self, x):
+        """Probability that a pump survives a PM interval of x months."""
+        return reliability(x, self.beta, self.eta_months)
+
+    def annual_cost(self, x):
+        """Annual PM cost plus expected corrective cost, in relative units (one PM job = 1)."""
+        x = np.asarray(x, float)
+        # 12 / x PM rounds a year, each one servicing every pump
+        preventive = (12 / x) * self.pm_cost * self.n_pumps
+        # Expected number of failures per pump in one interval, times the repair cost
+        corrective = self.failure_prob(x) * self.cm_cost * self.n_pumps
+        return preventive + corrective
+
+    def cost_index(self, x, base=CURRENT_PM_INTERVAL):
+        """Annual cost as an index: the plan with interval `base` (the current plan) = 100."""
+        return self.annual_cost(x) / self.annual_cost(base) * 100
+
+    def objectives(self, x):
+        """Both objectives for each interval in x: columns [annual cost index, failure probability]."""
+        return np.column_stack([self.cost_index(x), self.failure_prob(x)])
+
+    @classmethod
+    def from_params(cls, params):
+        """Build the model from the parameters saved by notebook 02.
+
+        The pump count is the number of pumps in the fitted data (n_units).
+        """
+        return cls(beta=params["beta"], eta_months=params["eta_months"],
+                   n_pumps=params["n_units"])
+
+
+def pareto_mask(F):
+    """True for each row of F that no other row dominates (all objectives minimized)."""
+    F = np.asarray(F)
+    mask = np.ones(len(F), dtype=bool)
+    # Row i dominates row j if it is no worse in every objective and strictly
+    # better in at least one. Rows already known to be dominated are skipped,
+    # since anything they dominate is also dominated by whatever beat them.
+    for i in range(len(F)):
+        if mask[i]:
+            dominated = np.all(F[i] <= F, axis=1) & np.any(F[i] < F, axis=1)
+            mask[dominated] = False
+    return mask
+
+
+def brute_force_front(model, n_points=20_000, bounds=BOUNDS):
+    """Exact Pareto front by evaluating a dense grid of intervals (possible with one variable)."""
+    x = np.linspace(bounds[0], bounds[1], n_points)
+    F = model.objectives(x)
+    keep = pareto_mask(F)
+    return x[keep], F[keep]
+
+
+def interval_label(months):
+    """Format a PM interval for display: 3.5 -> '3M 2W', 6 -> '6M'."""
+    whole = int(months)
+    return f"{whole}M" + (" 2W" if months - whole >= 0.5 else "")
+
+
+def practical_plans(model, step=0.5, bounds=BOUNDS):
+    """Evaluate schedulable intervals (half-month steps) and flag the Pareto-optimal ones."""
+    # The small epsilon makes the upper bound (e.g. 12 months) part of the range
+    x = np.arange(bounds[0], bounds[1] + 1e-9, step)
+    F = model.objectives(x)
+    return pd.DataFrame({
+        "interval_months": x,
+        "label": [interval_label(v) for v in x],
+        "annual_cost_index": F[:, 0],
+        "failure_prob_pct": F[:, 1] * 100,
+        "reliability_pct": (1 - F[:, 1]) * 100,
+        "pareto_optimal": pareto_mask(F),
+    })
+
+
+def compare_with_current(model, current_x=CURRENT_PM_INTERVAL):
+    """Current plan vs the recommended plan (lowest-cost Pareto-optimal half-month plan)."""
+    plans = practical_plans(model)
+    cur = plans.set_index("interval_months").loc[current_x]
+    sel = plans.loc[plans["annual_cost_index"].idxmin()]
+    table = pd.DataFrame({
+        f"Current ({cur['label']})": [cur["annual_cost_index"], cur["reliability_pct"]],
+        f"Recommended ({sel['label']})": [sel["annual_cost_index"], sel["reliability_pct"]],
+    }, index=["Annual cost (index, current plan = 100)", "Reliability over interval (%)"])
+    table["Change"] = table.iloc[:, 1] - table.iloc[:, 0]
+    return table

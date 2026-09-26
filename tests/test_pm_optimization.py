@@ -6,6 +6,11 @@ import pytest
 
 import pm_optimization as pm
 
+# Fixed reference parameters with known results, used to check the cost model
+REF_BETA = 1.0585
+REF_ETA_MONTHS = 76725.73 / pm.HOURS_PER_MONTH
+REF_N_PUMPS = 97
+
 
 def make_orders(rows):
     """Build a tiny work-order table in the same format as the CMMS export."""
@@ -92,3 +97,44 @@ def test_save_and_load_params(tmp_path):
     loaded = pm.load_params(path)
     assert loaded["beta"] == 1.2
     assert loaded["eta_months"] == pytest.approx(730.08 / pm.HOURS_PER_MONTH)
+
+
+# Optimization model
+def test_cost_model_known_values():
+    """With the reference parameters, the cost model gives the known results."""
+    # Known results: the 6-month plan has R = 95.29%; the 3.5-month plan costs 14% less (index 85.96)
+    model = pm.PMModel(beta=REF_BETA, eta_months=REF_ETA_MONTHS, n_pumps=REF_N_PUMPS)
+    assert model.cost_index(6) == pytest.approx(100)
+    assert model.reliability(6) == pytest.approx(0.9529, abs=1e-4)
+    assert model.cost_index(3.5) == pytest.approx(85.963, abs=0.014)
+
+
+def test_pareto_mask():
+    """Only rows that no other row beats in both objectives are kept."""
+    # rows: [cost, failure prob]; the last two are dominated
+    F = np.array([[1, 5], [2, 4], [3, 3], [3, 4], [5, 5]])
+    assert list(pm.pareto_mask(F)) == [True, True, True, False, False]
+
+
+def test_interval_label():
+    """Whole months print as 'nM'; a half month adds ' 2W' (two weeks)."""
+    assert pm.interval_label(3.5) == "3M 2W"
+    assert pm.interval_label(6) == "6M"
+
+
+def test_selected_plan_known_case():
+    """With the reference parameters, the cheapest schedulable plan is 3.5 months and Pareto-optimal."""
+    model = pm.PMModel(beta=REF_BETA, eta_months=REF_ETA_MONTHS, n_pumps=REF_N_PUMPS)
+    plans = pm.practical_plans(model)
+    best = plans.loc[plans["annual_cost_index"].idxmin()]
+    assert best["label"] == "3M 2W"
+    assert best["pareto_optimal"]
+
+
+def test_front_ends_at_the_cost_minimum():
+    """The exact Pareto front runs from the shortest interval up to the cost minimum."""
+    # Beyond the cheapest interval, longer intervals cost more AND fail more, so they are dominated
+    model = pm.PMModel(beta=1.2, eta_months=50, n_pumps=99)
+    x_front, _ = pm.brute_force_front(model, n_points=5000)
+    x = np.linspace(*pm.BOUNDS, 5000)
+    assert x_front.max() == pytest.approx(x[model.annual_cost(x).argmin()])
