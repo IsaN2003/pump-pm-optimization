@@ -138,3 +138,33 @@ def test_front_ends_at_the_cost_minimum():
     x_front, _ = pm.brute_force_front(model, n_points=5000)
     x = np.linspace(*pm.BOUNDS, 5000)
     assert x_front.max() == pytest.approx(x[model.annual_cost(x).argmin()])
+
+
+# NSGA-II
+# These use a small population and budget so the tests stay fast.
+def test_nsga2_matches_exact_front():
+    """A short NSGA-II run covers the same range of intervals as the exact front."""
+    model = pm.PMModel(beta=REF_BETA, eta_months=REF_ETA_MONTHS, n_pumps=REF_N_PUMPS)
+    res = pm.run_nsga2(model, pop_size=60, n_evals=3000, seed=0)
+    x_exact, _ = pm.brute_force_front(model)
+    assert res.X.min() == pytest.approx(x_exact.min(), abs=0.05)
+    assert res.X.max() == pytest.approx(x_exact.max(), abs=0.05)
+
+
+def test_reference_point_is_beyond_the_front():
+    """Every point of the exact front is better than the reference point in both objectives."""
+    model = pm.PMModel(beta=1.2, eta_months=50, n_pumps=99)
+    _, F_exact = pm.brute_force_front(model)
+    ref = pm.reference_point(model)
+    assert (F_exact < ref).all()
+
+
+def test_nsga2_hypervolume_close_to_exact():
+    """A short NSGA-II run reaches more than 97% of the exact front's hypervolume."""
+    model = pm.PMModel(beta=1.2, eta_months=50, n_pumps=99)
+    _, F_exact = pm.brute_force_front(model)
+    ref = pm.reference_point(model)
+    res = pm.run_nsga2(model, pop_size=60, n_evals=3000, seed=0)
+    hv_ratio = pm.hypervolume(res.F, ref) / pm.hypervolume(F_exact, ref)
+    # The exact front is sampled on a finite grid, so NSGA-II may edge very slightly above it
+    assert 0.97 < hv_ratio <= 1.0001

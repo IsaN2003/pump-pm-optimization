@@ -1,10 +1,11 @@
 """Shared code for the pump preventive-maintenance optimization project.
 
 The notebooks import this module so that paths, model constants, the
-data-preparation logic, the Weibull fitting and the PM-interval optimization
-model live in one place and can be unit tested.
+data-preparation logic, the Weibull fitting, the PM-interval optimization
+model and the NSGA-II runs live in one place and can be unit tested.
 """
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -286,3 +287,83 @@ def compare_with_current(model, current_x=CURRENT_PM_INTERVAL):
     }, index=["Annual cost (index, current plan = 100)", "Reliability over interval (%)"])
     table["Change"] = table.iloc[:, 1] - table.iloc[:, 0]
     return table
+
+
+# NSGA-II
+# pymoo is imported inside the functions below, so the data-preparation and
+# Weibull code (and their tests) still work without it installed.
+def make_problem(model, bounds=BOUNDS):
+    """Wrap a PMModel as a pymoo Problem (1 variable, 2 objectives)."""
+    from pymoo.core.problem import Problem
+
+    class PumpPMProblem(Problem):
+        def __init__(self):
+            super().__init__(n_var=1, n_obj=2, xl=bounds[0], xu=bounds[1])
+
+        def _evaluate(self, x, out, *args, **kwargs):
+            # pymoo passes the whole population at once: x has one row per
+            # solution and one column (the interval in months)
+            out["F"] = model.objectives(x[:, 0])
+
+    return PumpPMProblem()
+
+
+def run_nsga2(model, pop_size=400, n_evals=50_000, p_crossover=0.98, eta_c=20,
+              p_mutate=0.01, eta_m=20, seed=1):
+    """Run NSGA-II (pymoo) on the PM model. Returns the result: res.X (intervals), res.F (objectives)."""
+    from pymoo.algorithms.moo.nsga2 import NSGA2
+    from pymoo.operators.crossover.sbx import SBX
+    from pymoo.operators.mutation.pm import PM
+    from pymoo.optimize import minimize as pymoo_minimize
+
+    # Mutation is attempted on every offspring (prob=1.0) and each variable is
+    # changed with probability p_mutate; with a single variable that is
+    # p_mutate per offspring.
+    algorithm = NSGA2(
+        pop_size=pop_size,
+        crossover=SBX(prob=p_crossover, eta=eta_c),
+        mutation=PM(prob=1.0, prob_var=p_mutate, eta=eta_m),
+    )
+    # Stop after a fixed number of evaluations, so runs with different
+    # population sizes get the same budget
+    return pymoo_minimize(make_problem(model), algorithm, ("n_eval", n_evals), seed=seed, verbose=False)
+
+
+def reference_point(model, margin=1.1):
+    """Hypervolume reference point: the exact front's worst corner (nadir), plus a margin."""
+    _, F_exact = brute_force_front(model)
+    return F_exact.max(axis=0) * margin
+
+
+def hypervolume(F, ref_point):
+    """Hypervolume of a set of objective vectors (higher is better)."""
+    from pymoo.indicators.hv import HV
+    return float(HV(ref_point=ref_point)(np.asarray(F)))
+
+
+def tuning_runs(model, setting, values, n_trials=5, **base_kwargs):
+    """Run NSGA-II n_trials times for each value of one setting; return the hypervolume of every run."""
+    ref = reference_point(model)
+    rows = []
+    for value in values:
+        for trial in range(n_trials):
+            # The same seeds are reused for every level, so the levels are
+            # compared on equal terms
+            kwargs = {**base_kwargs, setting: value, "seed": 1000 + trial}
+            res = run_nsga2(model, **kwargs)
+            rows.append({"setting": setting, "value": value, "trial": trial,
+                         "hypervolume": hypervolume(res.F, ref)})
+    return pd.DataFrame(rows)
+
+
+def population_sweep(model, pop_sizes, seed=1, **base_kwargs):
+    """Hypervolume and runtime of one NSGA-II run per population size (fixed evaluation budget)."""
+    ref = reference_point(model)
+    rows = []
+    # The budget is fixed, so a larger population means fewer generations
+    for pop in pop_sizes:
+        start = time.perf_counter()
+        res = run_nsga2(model, pop_size=pop, seed=seed, **base_kwargs)
+        rows.append({"pop_size": pop, "hypervolume": hypervolume(res.F, ref),
+                     "runtime_s": time.perf_counter() - start})
+    return pd.DataFrame(rows)
